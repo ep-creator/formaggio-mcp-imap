@@ -208,9 +208,6 @@ export async function withImap<T>(
       user: config.user,
       pass: config.password,
     },
-    tls: {
-      rejectUnauthorized: config.tlsRejectUnauthorized,
-    },
     logger: false,
     connectionTimeout: TIMEOUT_MS,
     greetingTimeout: TIMEOUT_MS,

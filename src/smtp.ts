@@ -69,9 +69,6 @@ export function createSmtpTransport(config: SkyMailConfig) {
       user: config.user,
       pass: config.password,
     },
-    tls: {
-      rejectUnauthorized: config.tlsRejectUnauthorized,
-    },
     connectionTimeout: TIMEOUT_MS,
     greetingTimeout: TIMEOUT_MS,
     socketTimeout: TIMEOUT_MS,

@@ -6,7 +6,6 @@ export interface SkyMailConfig {
   smtpHost: string;
   smtpPort: number;
   allowSend: boolean;
-  tlsRejectUnauthorized: boolean;
 }
 
 export function loadConfig(): SkyMailConfig {
@@ -17,8 +16,6 @@ export function loadConfig(): SkyMailConfig {
   const smtpHost = process.env.SKYMAIL_SMTP_HOST?.trim() || "smtp.skymail.net.br";
   const smtpPort = Number.parseInt(process.env.SKYMAIL_SMTP_PORT || "465", 10);
   const allowSend = process.env.SKYMAIL_ALLOW_SEND?.trim().toLowerCase() === "true";
-  const tlsRejectUnauthorized =
-    process.env.SKYMAIL_TLS_REJECT_UNAUTHORIZED?.trim().toLowerCase() !== "false";
 
   if (!user) {
     throw new Error("Missing required environment variable: SKYMAIL_USER");
@@ -41,7 +38,6 @@ export function loadConfig(): SkyMailConfig {
     smtpHost,
     smtpPort,
     allowSend,
-    tlsRejectUnauthorized,
   };
 }
 

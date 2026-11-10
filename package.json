@@ -9,8 +9,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "check": "npm run build && node --env-file=.env dist/check.js",
-    "inspect": "npm run build && npx @modelcontextprotocol/inspector node --env-file=.env dist/index.js"
+    "check": "npm run build && node --use-system-ca --env-file=.env dist/check.js",
+    "inspect": "npm run build && npx @modelcontextprotocol/inspector node --use-system-ca --env-file=.env dist/index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
