@@ -1,0 +1,28 @@
+{
+  "name": "formaggio-mcp-imap",
+  "version": "0.1.0",
+  "description": "Local stdio MCP server for SkyMail (IMAP/SMTP)",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "npm run build && node --env-file=.env dist/check.js",
+    "inspect": "npm run build && npx @modelcontextprotocol/inspector node --env-file=.env dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "imapflow": "^1.0.171",
+    "mailparser": "^3.7.2",
+    "nodemailer": "^6.10.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^22.13.0",
+    "@types/nodemailer": "^6.4.17",
+    "typescript": "^5.8.2"
+  }
+}
