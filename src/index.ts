@@ -6,6 +6,7 @@ import {
   createDraft,
   createFolder,
   deleteFolder,
+  findKeyword,
   getEmail,
   listFolders,
   moveEmails,
@@ -350,7 +351,112 @@ async function main(): Promise<void> {
     },
   );
 
-  // 8. create_draft
+  // 8. find_keyword
+  server.registerTool(
+    "find_keyword",
+    {
+      description:
+        "Search decoded headers and text parts (`text/plain` and `text/html` converted to plain text) for a case-insensitive, accent-insensitive, whole-word `keyword` without downloading or matching base64-encoded attachments/images. Returns where each match appears (`inHeader`, `bodyMatches` with `snippet`, `position` 0-1, `inQuotedReply`, `inSignature`), and flags false positives from raw IMAP TEXT search as `{ uid, noTextMatch: true }`.",
+      inputSchema: {
+        folder: z
+          .string()
+          .default("INBOX")
+          .describe(
+            "Exact mailbox folder path (default: INBOX). Preserve trailing spaces if the folder name has them.",
+          ),
+        keyword: z
+          .string()
+          .min(1)
+          .describe(
+            "Case-insensitive, accent-insensitive, whole-word keyword or phrase (e.g. 'SIAL', 'ANUGA')",
+          ),
+        uids: z
+          .array(z.number().int().positive())
+          .max(200)
+          .optional()
+          .describe(
+            "Optional list of candidate UIDs to inspect (max 200). If omitted, uses IMAP SEARCH TEXT candidates.",
+          ),
+        since: z
+          .string()
+          .optional()
+          .describe("Optional filter when `uids` is omitted: messages on/after YYYY-MM-DD"),
+        before: z
+          .string()
+          .optional()
+          .describe("Optional filter when `uids` is omitted: messages before YYYY-MM-DD"),
+        contextChars: z
+          .number()
+          .int()
+          .min(20)
+          .max(1000)
+          .default(120)
+          .describe("Characters of context around each body match (default 120)"),
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .default(0)
+          .describe("Pagination offset into the candidate list (default 0)"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .default(50)
+          .describe("Max candidates to inspect per call (default 50, max 200)"),
+      },
+    },
+    async (args) => {
+      try {
+        const res = await findKeyword(config, args);
+        const wrappedResults = res.results.map((item) => {
+          if ("noTextMatch" in item) {
+            return item;
+          }
+          return {
+            uid: item.uid,
+            date: item.date,
+            from: wrapUntrusted(item.from),
+            subject: wrapUntrusted(item.subject),
+            inHeader: item.inHeader,
+            bodyMatches: item.bodyMatches.map((bm) => ({
+              snippet: wrapUntrusted(bm.snippet),
+              position: bm.position,
+              inQuotedReply: bm.inQuotedReply,
+              inSignature: bm.inSignature,
+            })),
+            matchedOnlyInAttachmentsOrEncodedData:
+              item.matchedOnlyInAttachmentsOrEncodedData,
+          };
+        });
+
+        return okResult(
+          JSON.stringify(
+            {
+              note: UNTRUSTED_WARNING,
+              folder: res.folder,
+              keyword: res.keyword,
+              totalCandidates: res.totalCandidates,
+              offset: res.offset,
+              count: res.count,
+              hasMore: res.hasMore,
+              nextOffset: res.nextOffset,
+              matchedCount: res.matchedCount,
+              falsePositiveCount: res.falsePositiveCount,
+              results: wrappedResults,
+            },
+            null,
+            2,
+          ),
+        );
+      } catch (err) {
+        return errorResult(err, config);
+      }
+    },
+  );
+
+  // 9. create_draft
   server.registerTool(
     "create_draft",
     {

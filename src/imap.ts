@@ -145,6 +145,55 @@ export interface DeleteFolderResult {
   deleted: boolean;
 }
 
+export interface FindKeywordInput {
+  folder?: string;
+  keyword: string;
+  uids?: number[];
+  since?: string;
+  before?: string;
+  contextChars?: number;
+  offset?: number;
+  limit?: number;
+}
+
+export interface BodyKeywordMatch {
+  snippet: string;
+  position: number;
+  inQuotedReply: boolean;
+  inSignature: boolean;
+}
+
+export interface FindKeywordHit {
+  uid: number;
+  date: string | null;
+  from: string;
+  subject: string;
+  inHeader: Array<"subject" | "from" | "to" | "cc">;
+  bodyMatches: BodyKeywordMatch[];
+  matchedOnlyInAttachmentsOrEncodedData: boolean;
+}
+
+export interface FindKeywordMiss {
+  uid: number;
+  noTextMatch: true;
+  matchedOnlyInAttachmentsOrEncodedData: true;
+}
+
+export type FindKeywordItem = FindKeywordHit | FindKeywordMiss;
+
+export interface FindKeywordResult {
+  folder: string;
+  keyword: string;
+  totalCandidates: number;
+  offset: number;
+  count: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+  matchedCount: number;
+  falsePositiveCount: number;
+  results: FindKeywordItem[];
+}
+
 export interface DraftOrSendInput {
   to: string;
   cc?: string;
@@ -176,6 +225,7 @@ export interface SendEmailResult {
 }
 
 const TIMEOUT_MS = 15_000;
+const SOCKET_TIMEOUT_MS = 90_000;
 const MAX_BODY_CHARS = 20_000;
 
 /**
@@ -277,6 +327,7 @@ export function htmlToReadableText(html: string): string {
 
 let sharedClient: ImapFlow | null = null;
 let imapQueue: Promise<unknown> = Promise.resolve();
+let pendingImapCalls = 0;
 
 async function getConnectedClient(config: SkyMailConfig): Promise<ImapFlow> {
   if (sharedClient && sharedClient.usable) {
@@ -302,7 +353,7 @@ async function getConnectedClient(config: SkyMailConfig): Promise<ImapFlow> {
     logger: false,
     connectionTimeout: TIMEOUT_MS,
     greetingTimeout: TIMEOUT_MS,
-    socketTimeout: TIMEOUT_MS,
+    socketTimeout: SOCKET_TIMEOUT_MS,
   });
 
   client.on("error", (err) => {
@@ -321,15 +372,31 @@ async function getConnectedClient(config: SkyMailConfig): Promise<ImapFlow> {
 }
 
 /**
- * Runs an IMAP operation serialized on a warm, lazy connection (reconnecting automatically if dropped).
+ * Serializes IMAP operations over a single connection and automatically runs LOGOUT
+ * as soon as the last queued call finishes (`pendingImapCalls === 0`), so no idle
+ * session is ever left open to compete with Outlook.
  */
 export async function withImap<T>(
   config: SkyMailConfig,
   work: (client: ImapFlow) => Promise<T>,
 ): Promise<T> {
+  pendingImapCalls++;
   const run = async (): Promise<T> => {
-    const client = await getConnectedClient(config);
-    return await work(client);
+    try {
+      const client = await getConnectedClient(config);
+      return await work(client);
+    } finally {
+      pendingImapCalls--;
+      if (pendingImapCalls === 0 && sharedClient) {
+        const clientToClose = sharedClient;
+        sharedClient = null;
+        try {
+          await clientToClose.logout();
+        } catch {
+          clientToClose.close();
+        }
+      }
+    }
   };
 
   const resultPromise = imapQueue.then(run, run);
@@ -570,7 +637,10 @@ export async function searchEmails(
     const lock = await client.getMailboxLock(folder);
     try {
       const rawUids = await client.search(criteria, { uid: true });
-      const allAscending = rawUids || [];
+      if (rawUids === false) {
+        throw new Error(`IMAP SEARCH failed or timed out in folder "${folder}".`);
+      }
+      const allAscending = rawUids;
       const total = allAscending.length;
 
       // Sort descending (newest UIDs first)
@@ -1009,6 +1079,555 @@ export async function deleteFolder(
 
     await logOperation("delete_folder", { ...result });
     return result;
+  });
+}
+
+interface TextPartSpec {
+  key: string;
+  mimeType: "text/plain" | "text/html";
+  encoding: string;
+  charset: string;
+}
+
+function collectTextParts(
+  node?: MessageStructureObject,
+  isRoot = true,
+): TextPartSpec[] {
+  if (!node) return [];
+  const disposition = (node.disposition || "").toLowerCase();
+  if (disposition === "attachment") {
+    return [];
+  }
+
+  const mimeType = (node.type || "").toLowerCase();
+  if (mimeType === "message/rfc822") {
+    // Never descend into attached/encapsulated message/rfc822 parts
+    return [];
+  }
+
+  if (Array.isArray(node.childNodes) && node.childNodes.length > 0) {
+    const out: TextPartSpec[] = [];
+    for (const child of node.childNodes) {
+      out.push(...collectTextParts(child, false));
+    }
+    return out;
+  }
+
+  // Skip inline files that carry a filename
+  const hasFilename = Boolean(
+    node.dispositionParameters?.filename || node.parameters?.name,
+  );
+  if (hasFilename) {
+    return [];
+  }
+
+  if (mimeType === "text/plain" || mimeType === "text/html") {
+    const key = isRoot && !node.part ? "text" : (node.part || "text").toLowerCase();
+    const encoding = (node.encoding || "7bit").toLowerCase();
+    const charset = (node.parameters?.charset || "utf-8").toLowerCase().trim();
+    return [{ key, mimeType, encoding, charset }];
+  }
+
+  return [];
+}
+
+function decodeQuotedPrintable(input: Buffer): Buffer {
+  const str = input.toString("latin1").replace(/=[ \t]*\r?\n/g, "");
+  const bytes: number[] = [];
+  for (let i = 0; i < str.length; i++) {
+    if (
+      str[i] === "=" &&
+      i + 2 < str.length &&
+      /^[0-9A-Fa-f]{2}$/.test(str.slice(i + 1, i + 3))
+    ) {
+      bytes.push(Number.parseInt(str.slice(i + 1, i + 3), 16));
+      i += 2;
+    } else {
+      bytes.push(str.charCodeAt(i));
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+function decodePartBuffer(
+  raw: Buffer,
+  encoding: string,
+  charset: string,
+): string {
+  let bytes: Buffer;
+  if (encoding === "base64") {
+    bytes = Buffer.from(raw.toString("ascii"), "base64");
+  } else if (encoding === "quoted-printable") {
+    bytes = decodeQuotedPrintable(raw);
+  } else {
+    bytes = raw;
+  }
+
+  const normalizedCharset =
+    charset === "utf8" || !charset
+      ? "utf-8"
+      : charset === "latin1" || charset === "iso8859-1" || charset === "cp1252"
+        ? "windows-1252"
+        : charset;
+
+  try {
+    return new TextDecoder(normalizedCharset, { fatal: false }).decode(bytes);
+  } catch {
+    return bytes.toString("utf8");
+  }
+}
+
+function foldChar(ch: string): string {
+  return ch
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function foldWithIndexMap(text: string): { folded: string; mapToOrig: number[] } {
+  const chars: string[] = [];
+  const mapToOrig: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const f = foldChar(text[i]);
+    for (let j = 0; j < f.length; j++) {
+      chars.push(f[j]);
+      mapToOrig.push(i);
+    }
+  }
+  mapToOrig.push(text.length);
+  return { folded: chars.join(""), mapToOrig };
+}
+
+function buildKeywordRegex(keyword: string): RegExp {
+  const foldedKw = keyword
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+  if (!foldedKw) {
+    throw new Error("Keyword must not be empty.");
+  }
+  const escaped = foldedKw
+    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\s+/g, "\\s+");
+  const prefix = /^[a-z0-9]/.test(foldedKw) ? "(?<![a-z0-9])" : "";
+  const suffix = /[a-z0-9]$/.test(foldedKw) ? "(?![a-z0-9])" : "";
+  return new RegExp(`${prefix}${escaped}${suffix}`, "g");
+}
+
+function hasWholeWordMatch(text: string, regex: RegExp): boolean {
+  if (!text) return false;
+  const { folded } = foldWithIndexMap(text);
+  regex.lastIndex = 0;
+  return regex.test(folded);
+}
+
+interface LineSpan {
+  index: number;
+  start: number;
+  end: number;
+  raw: string;
+  folded: string;
+}
+
+function splitLinesWithSpans(text: string): LineSpan[] {
+  const spans: LineSpan[] = [];
+  let pos = 0;
+  const rawLines = text.split("\n");
+  for (let i = 0; i < rawLines.length; i++) {
+    const raw = rawLines[i].replace(/\r$/, "");
+    const start = pos;
+    const end = pos + rawLines[i].length;
+    spans.push({
+      index: i,
+      start,
+      end,
+      raw,
+      folded: raw
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .trim(),
+    });
+    pos = end + 1;
+  }
+  return spans;
+}
+
+function isReplyHeaderLine(lines: LineSpan[], idx: number): boolean {
+  const line = lines[idx].folded;
+  if (!line) return false;
+
+  // Classic Outlook / webmail separators
+  if (
+    /^-{2,}\s*(original message|mensagem original|forwarded message|mensagem encaminhada)/i.test(
+      line,
+    )
+  ) {
+    return true;
+  }
+  // "On ... wrote:" / "Em ... escreveu:"
+  if (/^(on\s+.+\s+wrote|em\s+.+\s+escreveu)\s*:?$/i.test(line)) {
+    return true;
+  }
+  // "De: ..." / "From: ..." / "Enviada em: ..." / "Assunto: ..." / "Subject: ..."
+  if (
+    /^[>\s*]*(de|from|enviada em|sent|assunto|subject)\s*:\s*\S+/i.test(line)
+  ) {
+    if (line.includes("@")) return true;
+    const windowStart = Math.max(0, idx - 4);
+    const windowEnd = Math.min(lines.length, idx + 8);
+    for (let j = windowStart; j < windowEnd; j++) {
+      if (j === idx) continue;
+      if (
+        /^[>\s*]*(de|from|enviada em|sent|data|date|para|to|cc|assunto|subject)\s*:\s*\S+/i.test(
+          lines[j].folded,
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isSignOffLine(foldedLine: string): boolean {
+  if (!foldedLine) return false;
+  if (/^--\s*$/.test(foldedLine)) return true;
+  return /^(atenciosamente|att\.?(?:,|;|$)|abracos|cordialmente|best regards|kind regards|warm regards|regards|sincerely|saludos|cordiales saludos|atentamente|cordiali saluti|distinti saluti|cordialement|bien cordialement)\b/i.test(
+    foldedLine,
+  );
+}
+
+function isDisclaimerLine(foldedLine: string): boolean {
+  if (!foldedLine) return false;
+  return /\b(aviso de confidencialidade|esta mensagem pode conter|this email and any attachments|confidentiality notice|disclaimer|antes de imprimir|before printing)\b/i.test(
+    foldedLine,
+  );
+}
+
+export function extractBodyKeywordMatches(
+  text: string,
+  regex: RegExp,
+  contextChars: number,
+): BodyKeywordMatch[] {
+  if (!text) return [];
+  const { folded, mapToOrig } = foldWithIndexMap(text);
+  const lines = splitLinesWithSpans(text);
+
+  // Locate all reply header boundaries
+  const replyBoundaryIndices: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (isReplyHeaderLine(lines, i)) {
+      replyBoundaryIndices.push(i);
+    }
+  }
+  const firstReplyBoundary =
+    replyBoundaryIndices.length > 0 ? replyBoundaryIndices[0] : Infinity;
+
+  const matches: BodyKeywordMatch[] = [];
+  regex.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(folded)) !== null) {
+    const origStart = mapToOrig[m.index] ?? 0;
+    const origEnd = mapToOrig[m.index + m[0].length] ?? text.length;
+
+    const snippetStart = Math.max(0, origStart - contextChars);
+    const snippetEnd = Math.min(text.length, origEnd + contextChars);
+    const snippet = text
+      .slice(snippetStart, snippetEnd)
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const position = Number(
+      (origStart / Math.max(text.length, 1)).toFixed(3),
+    );
+
+    // Find which line contains origStart
+    let lineIdx = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (origStart >= lines[i].start && origStart <= lines[i].end) {
+        lineIdx = i;
+        break;
+      }
+    }
+
+    const lineRaw = lines[lineIdx]?.raw ?? "";
+    const inQuotedReply =
+      /^\s*>/.test(lineRaw) || lineIdx >= firstReplyBoundary;
+
+    // Determine segment bounds [segStart, segEnd) for signature detection
+    let segStart = 0;
+    let segEnd = lines.length;
+    for (const bIdx of replyBoundaryIndices) {
+      if (bIdx <= lineIdx) {
+        segStart = bIdx;
+      } else if (bIdx > lineIdx) {
+        segEnd = bIdx;
+        break;
+      }
+    }
+
+    let inSignature = false;
+    // Check if inside a legal/disclaimer block (within 15 lines after disclaimer start)
+    for (let i = Math.max(segStart, lineIdx - 15); i <= lineIdx; i++) {
+      if (isDisclaimerLine(lines[i].folded)) {
+        inSignature = true;
+        break;
+      }
+    }
+
+    // Check if after a sign-off line in the current message segment and within ~25 lines of the end of the segment
+    if (!inSignature && segEnd - lineIdx <= 25) {
+      const lookbackStart = Math.max(segStart, lineIdx - 18);
+      for (let i = lookbackStart; i < lineIdx; i++) {
+        if (isSignOffLine(lines[i].folded)) {
+          inSignature = true;
+          break;
+        }
+      }
+    }
+
+    matches.push({
+      snippet,
+      position,
+      inQuotedReply,
+      inSignature,
+    });
+  }
+
+  return matches;
+}
+
+export async function findKeyword(
+  config: SkyMailConfig,
+  input: FindKeywordInput,
+): Promise<FindKeywordResult> {
+  // Never .trim() folder names: preserve trailing spaces
+  const folder = input.folder && input.folder.length > 0 ? input.folder : "INBOX";
+  const keyword = input.keyword.trim();
+  if (!keyword) {
+    throw new Error("`keyword` must not be empty.");
+  }
+  const regex = buildKeywordRegex(keyword);
+  const contextChars = Math.min(Math.max(input.contextChars ?? 120, 20), 1000);
+  const offset = Math.max(input.offset ?? 0, 0);
+  const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
+
+  if (input.uids && input.uids.length > 200) {
+    throw new Error(
+      `Maximum 200 UIDs allowed in find_keyword \`uids\` (received ${input.uids.length}).`,
+    );
+  }
+
+  return withImap(config, async (client) => {
+    const lock = await client.getMailboxLock(folder);
+    try {
+      let allCandidateUids: number[];
+      if (input.uids && input.uids.length > 0) {
+        allCandidateUids = Array.from(new Set(input.uids));
+      } else {
+        const criteria: SearchObject = { text: keyword };
+        if (input.since?.trim()) {
+          criteria.since = parseDateCriteria(input.since.trim(), "since");
+        }
+        if (input.before?.trim()) {
+          criteria.before = parseDateCriteria(input.before.trim(), "before");
+        }
+        const rawUids = await client.search(criteria, { uid: true });
+        if (rawUids === false) {
+          throw new Error(`IMAP SEARCH failed or timed out in folder "${folder}".`);
+        }
+        allCandidateUids = [...rawUids].reverse();
+      }
+
+      const totalCandidates = allCandidateUids.length;
+      const pageUids = allCandidateUids.slice(offset, offset + limit);
+      const hasMore = offset + pageUids.length < totalCandidates;
+      const nextOffset = hasMore ? offset + pageUids.length : null;
+
+      if (pageUids.length === 0) {
+        return {
+          folder,
+          keyword,
+          totalCandidates,
+          offset,
+          count: 0,
+          hasMore: false,
+          nextOffset: null,
+          matchedCount: 0,
+          falsePositiveCount: 0,
+          results: [],
+        };
+      }
+
+      // 1. Fetch envelope and bodyStructure for all candidates in pageUids
+      const metaList = await client.fetchAll(
+        pageUids,
+        {
+          uid: true,
+          envelope: true,
+          bodyStructure: true,
+        },
+        { uid: true },
+      );
+      const metaByUid = new Map(metaList.map((m) => [m.uid, m]));
+
+      // 2. Group UIDs by the text bodyParts keys they require
+      const specsByUid = new Map<number, TextPartSpec[]>();
+      const groupMap = new Map<string, { keys: string[]; uids: number[] }>();
+
+      for (const uid of pageUids) {
+        const meta = metaByUid.get(uid);
+        if (!meta) continue;
+        const specs = collectTextParts(meta.bodyStructure, true);
+        specsByUid.set(uid, specs);
+        if (specs.length > 0) {
+          const uniqueKeys = Array.from(new Set(specs.map((s) => s.key))).sort();
+          const sig = uniqueKeys.join(",");
+          let group = groupMap.get(sig);
+          if (!group) {
+            group = { keys: uniqueKeys, uids: [] };
+            groupMap.set(sig, group);
+          }
+          group.uids.push(uid);
+        }
+      }
+
+      // 3. Batch-fetch only those text bodyParts (never attachments!) via BODY.PEEK
+      const bodyPartsByUid = new Map<number, Map<string, Buffer>>();
+      for (const group of groupMap.values()) {
+        const fetchedParts = await client.fetchAll(
+          group.uids,
+          {
+            uid: true,
+            bodyParts: group.keys,
+          },
+          { uid: true },
+        );
+        for (const item of fetchedParts) {
+          if (item.bodyParts) {
+            bodyPartsByUid.set(item.uid, item.bodyParts);
+          }
+        }
+      }
+
+      // 4. Decode text parts and run accent/case-insensitive whole-word matching
+      const results: FindKeywordItem[] = [];
+      let matchedCount = 0;
+      let falsePositiveCount = 0;
+
+      for (const uid of pageUids) {
+        const meta = metaByUid.get(uid);
+        if (!meta) {
+          falsePositiveCount++;
+          results.push({
+            uid,
+            noTextMatch: true,
+            matchedOnlyInAttachmentsOrEncodedData: true,
+          });
+          continue;
+        }
+
+        const subjectStr = meta.envelope?.subject ?? "";
+        const fromStr = formatAddress(meta.envelope?.from?.[0]);
+        const toStr = formatAddressList(meta.envelope?.to).join(", ");
+        const ccStr = formatAddressList(meta.envelope?.cc).join(", ");
+
+        const inHeader: Array<"subject" | "from" | "to" | "cc"> = [];
+        if (hasWholeWordMatch(subjectStr, regex)) inHeader.push("subject");
+        if (hasWholeWordMatch(fromStr, regex)) inHeader.push("from");
+        if (hasWholeWordMatch(toStr, regex)) inHeader.push("to");
+        if (hasWholeWordMatch(ccStr, regex)) inHeader.push("cc");
+
+        const specs = specsByUid.get(uid) ?? [];
+        const partsMap = bodyPartsByUid.get(uid);
+
+        const plainChunks: string[] = [];
+        const htmlChunks: string[] = [];
+
+        if (partsMap) {
+          for (const spec of specs) {
+            const rawBuf =
+              partsMap.get(spec.key) ?? partsMap.get(spec.key.toUpperCase());
+            if (!rawBuf || rawBuf.length === 0) continue;
+            const decoded = decodePartBuffer(
+              rawBuf,
+              spec.encoding,
+              spec.charset,
+            );
+            if (spec.mimeType === "text/plain") {
+              plainChunks.push(decoded);
+            } else {
+              htmlChunks.push(htmlToReadableText(decoded));
+            }
+          }
+        }
+
+        const plainText = plainChunks.join("\n\n").trim();
+        const htmlText = htmlChunks.join("\n\n").trim();
+
+        let bodyMatches: BodyKeywordMatch[] = [];
+        if (plainText) {
+          bodyMatches = extractBodyKeywordMatches(plainText, regex, contextChars);
+        }
+        if (htmlText) {
+          if (!plainText) {
+            bodyMatches = extractBodyKeywordMatches(htmlText, regex, contextChars);
+          } else {
+            const htmlMatches = extractBodyKeywordMatches(
+              htmlText,
+              regex,
+              contextChars,
+            );
+            for (const hm of htmlMatches) {
+              // Only add an HTML match if it wasn't already captured at a nearby relative position in text/plain
+              const alreadyPresent = bodyMatches.some(
+                (bm) => Math.abs(bm.position - hm.position) < 0.08,
+              );
+              if (!alreadyPresent) {
+                bodyMatches.push(hm);
+              }
+            }
+          }
+        }
+
+        if (inHeader.length === 0 && bodyMatches.length === 0) {
+          falsePositiveCount++;
+          results.push({
+            uid,
+            noTextMatch: true,
+            matchedOnlyInAttachmentsOrEncodedData: true,
+          });
+        } else {
+          matchedCount++;
+          results.push({
+            uid,
+            date: meta.envelope?.date ? meta.envelope.date.toISOString() : null,
+            from: fromStr,
+            subject: subjectStr || "(no subject)",
+            inHeader,
+            bodyMatches,
+            matchedOnlyInAttachmentsOrEncodedData: false,
+          });
+        }
+      }
+
+      return {
+        folder,
+        keyword,
+        totalCandidates,
+        offset,
+        count: results.length,
+        hasMore,
+        nextOffset,
+        matchedCount,
+        falsePositiveCount,
+        results,
+      };
+    } finally {
+      lock.release();
+    }
   });
 }
 
