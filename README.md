@@ -44,6 +44,8 @@ SKYMAIL_IMAP_PORT=993
 SKYMAIL_SMTP_HOST=smtp.skymail.net.br
 SKYMAIL_SMTP_PORT=465
 SKYMAIL_ALLOW_SEND=false
+# Set to false if behind corporate firewall/antivirus SSL inspection (SELF_SIGNED_CERT_IN_CHAIN)
+SKYMAIL_TLS_REJECT_UNAUTHORIZED=true
 ```
 
 ### 3. Run the smoke test
