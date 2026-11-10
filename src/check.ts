@@ -1,5 +1,6 @@
 import { loadConfig, sanitizeError } from "./config.js";
 import {
+  closeImapConnection,
   fetchEmailInLockedMailbox,
   listFolders,
   summariseMessageObject,
@@ -96,10 +97,12 @@ async function runCheck(): Promise<void> {
   console.log("4) Verifying SMTP login (no email sent)...");
   await verifySmtpLogin(config);
   console.log("   ✓ SMTP login verified successfully.");
+  await closeImapConnection();
   console.log("\nAll checks passed!");
 }
 
-runCheck().catch((err) => {
+runCheck().catch(async (err) => {
   console.error("\nCheck failed:", sanitizeError(err));
+  await closeImapConnection();
   process.exit(1);
 });

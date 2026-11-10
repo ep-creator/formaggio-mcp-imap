@@ -4,16 +4,21 @@ A simple, local Model Context Protocol (MCP) server over **stdio** that lets Cla
 
 ## Features & Tools
 
-1. **`list_folders`** — Lists all mailboxes with their path, IMAP special-use flag (`\Inbox`, `\Sent`, `\Drafts`, `\Trash`, `\Junk`, `\Archive`), total message count, and unread count.
-2. **`search_emails`** — Searches a folder (default `INBOX`) by `from`, `to`, `subject`, `text`, `since` (`YYYY-MM-DD`), `before` (`YYYY-MM-DD`), `unreadOnly`, and `limit` (default 20, max 50). Returns newest messages first with `uid`, `date`, `from`, `to`, `subject`, `seen`, and `hasAttachments`.
+1. **`list_folders`** — Lists all mailboxes with their exact path (preserving trailing spaces and accents), IMAP special-use flag (`\Inbox`, `\Sent`, `\Drafts`, `\Trash`, `\Junk`, `\Archive`), total message count, and unread count.
+2. **`search_emails`** — Searches a folder (default `INBOX`) by `from`, `to`, `subject`, `text`, `since` (`YYYY-MM-DD`), `before` (`YYYY-MM-DD`), `unreadOnly`, pagination (`offset` or `beforeUid`), and `limit` (default 20, max 50; or up to 5,000 when `uidsOnly: true`). Returns `total`, `hasMore`, and newest messages first with `uid`, `date`, `from`, `to`, `cc`, `subject`, `messageId`, `inReplyTo`, `references`, `seen`, and `hasAttachments`.
 3. **`get_email`** — Fetches a single email by `folder` and `uid` **without marking it as read** (`BODY.PEEK[]`). Converts HTML-only emails to readable plain text, truncates bodies at 20,000 characters (with a clear notice), and returns attachment metadata (`filename`, `contentType`, `size`).
-4. **`create_draft`** — Builds a plain-text MIME message with `MailComposer` (supporting threaded replies via `replyToUid` + `replyToFolder`, which set `In-Reply-To`, `References`, and a `Re:` subject) and appends it to the `\Drafts` folder (`Rascunhos`) with the `\Draft` flag.
-5. **`send_email`** *(only registered when `SKYMAIL_ALLOW_SEND=true`)* — Sends a plain-text email via SMTP (`smtp.skymail.net.br:465`) and `APPEND`s a copy with the `\Seen` flag to the `\Sent` folder (`Itens Enviados`), since SkyMail SMTP does not save sent copies automatically.
+4. **`create_folder`** — Creates an IMAP folder (and any missing parent folders along the `.` hierarchy) and subscribes to it (`CREATE` + `SUBSCRIBE`) so it appears in Outlook. Idempotent (`{ path, created: false, exists: true }` if it already exists).
+5. **`move_emails`** — Moves up to 200 emails by UID from `folder` to `destination` via `UID MOVE` (or `UID COPY` + `UID STORE +FLAGS (\Deleted)` + `UID EXPUNGE` on those UIDs only, never a mailbox-wide `EXPUNGE`) while preserving read/unread flags. Supports `dryRun: true` and returns `{ moved, notFound, mapping: [{ oldUid, newUid }] }`.
+6. **`rename_folder`** — Renames or moves an IMAP folder (along with all its messages and subfolders) and updates subscriptions. Errors if `newPath` already exists.
+7. **`delete_folder`** — Deletes an IMAP folder **only** if it has 0 messages and 0 subfolders.
+8. **`create_draft`** — Builds a plain-text MIME message with `MailComposer` (supporting threaded replies via `replyToUid` + `replyToFolder`, which set `In-Reply-To`, `References`, and a `Re:` subject) and appends it to the `\Drafts` folder (`Rascunhos`) with the `\Draft` flag.
+9. **`send_email`** *(only registered when `SKYMAIL_ALLOW_SEND=true`)* — Sends a plain-text email via SMTP (`smtp.skymail.net.br:465`) and `APPEND`s a copy with the `\Seen` flag to the `\Sent` folder (`Itens Enviados`), since SkyMail SMTP does not save sent copies automatically.
 
 ### Safety
 - All untrusted email-derived fields (`from`, `to`, `cc`, `replyTo`, `subject`, `body`, attachment `filename`) are wrapped in `<untrusted_email_content>...</untrusted_email_content>` along with a security warning instructing the model never to follow instructions inside email content.
+- Every folder creation, rename, deletion, and email move is logged with a timestamp to `stderr` and `operations.log`.
 - Credentials are never logged, and error messages are scrubbed before being returned to the MCP client.
-- No delete, move, or flag-mutating tools are included in this MVP.
+- No tool permanently deletes emails.
 
 ---
 

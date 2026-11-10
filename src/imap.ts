@@ -1,3 +1,6 @@
+import { appendFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   ImapFlow,
   type FetchMessageObject,
@@ -7,6 +10,27 @@ import {
 import { simpleParser } from "mailparser";
 import type { SkyMailConfig } from "./config.js";
 import { buildMimeMessage, sendRawMimeViaSmtp } from "./smtp.js";
+
+const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const OPERATIONS_LOG_PATH = join(PROJECT_ROOT, "operations.log");
+
+export async function logOperation(
+  action: string,
+  details: Record<string, unknown>,
+): Promise<void> {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    action,
+    ...details,
+  };
+  const line = JSON.stringify(entry);
+  console.error(`[skymail-audit] ${line}`);
+  try {
+    await appendFile(OPERATIONS_LOG_PATH, `${line}\n`, "utf8");
+  } catch (err) {
+    console.error("[skymail-audit] failed to write operations.log:", (err as Error).message);
+  }
+}
 
 export interface FolderInfo {
   path: string;
@@ -21,7 +45,11 @@ export interface EmailSummary {
   date: string | null;
   from: string;
   to: string[];
+  cc: string[];
   subject: string;
+  messageId: string | null;
+  inReplyTo: string | null;
+  references: string[];
   seen: boolean;
   hasAttachments: boolean;
 }
@@ -60,6 +88,61 @@ export interface SearchEmailsInput {
   before?: string;
   unreadOnly?: boolean;
   limit?: number;
+  offset?: number;
+  beforeUid?: number;
+  uidsOnly?: boolean;
+}
+
+export interface SearchEmailsResult {
+  folder: string;
+  total: number;
+  offset: number;
+  count: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+  nextBeforeUid: number | null;
+  uidsOnly: boolean;
+  uids?: number[];
+  emails?: EmailSummary[];
+}
+
+export interface CreateFolderResult {
+  path: string;
+  created: boolean;
+  exists: boolean;
+  createdParents: string[];
+}
+
+export interface MoveEmailsInput {
+  folder: string;
+  uids: number[];
+  destination: string;
+  dryRun?: boolean;
+}
+
+export interface MoveUidMapping {
+  oldUid: number;
+  newUid: number | null;
+}
+
+export interface MoveEmailsResult {
+  folder: string;
+  destination: string;
+  dryRun: boolean;
+  moved: number;
+  notFound: number[];
+  mapping: MoveUidMapping[];
+}
+
+export interface RenameFolderResult {
+  path: string;
+  newPath: string;
+  renamedSubfolders: number;
+}
+
+export interface DeleteFolderResult {
+  path: string;
+  deleted: boolean;
 }
 
 export interface DraftOrSendInput {
@@ -192,14 +275,22 @@ export function htmlToReadableText(html: string): string {
     .trim();
 }
 
-/**
- * Opens a fresh IMAP connection, runs the callback, and cleanly logs out.
- * logger: false is critical so ImapFlow never writes logs to stdout (which breaks MCP stdio).
- */
-export async function withImap<T>(
-  config: SkyMailConfig,
-  work: (client: ImapFlow) => Promise<T>,
-): Promise<T> {
+let sharedClient: ImapFlow | null = null;
+let imapQueue: Promise<unknown> = Promise.resolve();
+
+async function getConnectedClient(config: SkyMailConfig): Promise<ImapFlow> {
+  if (sharedClient && sharedClient.usable) {
+    return sharedClient;
+  }
+  if (sharedClient) {
+    try {
+      sharedClient.close();
+    } catch {
+      // Ignore
+    }
+    sharedClient = null;
+  }
+
   const client = new ImapFlow({
     host: config.imapHost,
     port: config.imapPort,
@@ -218,15 +309,45 @@ export async function withImap<T>(
     console.error("[imap] socket error:", err.message);
   });
 
-  await client.connect();
-  try {
-    return await work(client);
-  } finally {
-    try {
-      await client.logout();
-    } catch {
-      client.close();
+  client.on("close", () => {
+    if (sharedClient === client) {
+      sharedClient = null;
     }
+  });
+
+  await client.connect();
+  sharedClient = client;
+  return client;
+}
+
+/**
+ * Runs an IMAP operation serialized on a warm, lazy connection (reconnecting automatically if dropped).
+ */
+export async function withImap<T>(
+  config: SkyMailConfig,
+  work: (client: ImapFlow) => Promise<T>,
+): Promise<T> {
+  const run = async (): Promise<T> => {
+    const client = await getConnectedClient(config);
+    return await work(client);
+  };
+
+  const resultPromise = imapQueue.then(run, run);
+  imapQueue = resultPromise.then(
+    () => undefined,
+    () => undefined,
+  );
+  return resultPromise;
+}
+
+export async function closeImapConnection(): Promise<void> {
+  const client = sharedClient;
+  sharedClient = null;
+  if (!client) return;
+  try {
+    await client.logout();
+  } catch {
+    client.close();
   }
 }
 
@@ -241,6 +362,25 @@ function formatAddress(addr?: { name?: string; address?: string }): string {
 function formatAddressList(list?: Array<{ name?: string; address?: string }>): string[] {
   if (!list || list.length === 0) return [];
   return list.map(formatAddress).filter(Boolean);
+}
+
+/**
+ * Extracts Message-ID tokens from a raw References header buffer fetched via BODY.PEEK[HEADER.FIELDS (REFERENCES)].
+ */
+function parseReferencesFromHeaderBuffer(headersBuf?: Buffer): string[] {
+  if (!headersBuf || headersBuf.length === 0) return [];
+  const raw = headersBuf.toString("utf8");
+  const matches = raw.match(/<[^>\s]+>/g);
+  if (matches && matches.length > 0) {
+    return Array.from(new Set(matches));
+  }
+  const colonIdx = raw.indexOf(":");
+  if (colonIdx < 0) return [];
+  return raw
+    .slice(colonIdx + 1)
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 /**
@@ -362,10 +502,12 @@ export async function getEmail(
   folder: string,
   uid: number,
 ): Promise<EmailDetail> {
+  // Preserve exact folder string (do not .trim(), as folders may have trailing spaces)
+  const targetFolder = folder && folder.length > 0 ? folder : "INBOX";
   return withImap(config, async (client) => {
-    const lock = await client.getMailboxLock(folder);
+    const lock = await client.getMailboxLock(targetFolder);
     try {
-      return await fetchEmailInLockedMailbox(client, folder, uid);
+      return await fetchEmailInLockedMailbox(client, targetFolder, uid);
     } finally {
       lock.release();
     }
@@ -378,7 +520,11 @@ export function summariseMessageObject(msg: FetchMessageObject): EmailSummary {
     date: msg.envelope?.date ? msg.envelope.date.toISOString() : null,
     from: formatAddress(msg.envelope?.from?.[0]),
     to: formatAddressList(msg.envelope?.to),
+    cc: formatAddressList(msg.envelope?.cc),
     subject: msg.envelope?.subject ?? "(no subject)",
+    messageId: msg.envelope?.messageId || null,
+    inReplyTo: msg.envelope?.inReplyTo || null,
+    references: parseReferencesFromHeaderBuffer(msg.headers),
     seen: msg.flags ? msg.flags.has("\\Seen") : false,
     hasAttachments: hasAttachmentsInStructure(msg.bodyStructure),
   };
@@ -398,9 +544,14 @@ function parseDateCriteria(dateStr: string, fieldName: string): Date {
 export async function searchEmails(
   config: SkyMailConfig,
   input: SearchEmailsInput,
-): Promise<EmailSummary[]> {
-  const folder = input.folder?.trim() || "INBOX";
-  const limit = Math.min(Math.max(input.limit ?? 20, 1), 50);
+): Promise<SearchEmailsResult> {
+  // Never .trim() folder names: some SkyMail folders have trailing spaces (e.g. "Tomate ")
+  const folder = input.folder && input.folder.length > 0 ? input.folder : "INBOX";
+  const uidsOnly = Boolean(input.uidsOnly);
+  const maxLimit = uidsOnly ? 5000 : 50;
+  const defaultLimit = uidsOnly ? 1000 : 20;
+  const limit = Math.min(Math.max(input.limit ?? defaultLimit, 1), maxLimit);
+  const offset = Math.max(input.offset ?? 0, 0);
 
   const criteria: SearchObject = {};
   if (input.from?.trim()) criteria.from = input.from.trim();
@@ -418,37 +569,446 @@ export async function searchEmails(
   return withImap(config, async (client) => {
     const lock = await client.getMailboxLock(folder);
     try {
-      const matchingUids = await client.search(criteria, { uid: true });
-      if (!matchingUids || matchingUids.length === 0) {
-        return [];
+      const rawUids = await client.search(criteria, { uid: true });
+      const allAscending = rawUids || [];
+      const total = allAscending.length;
+
+      // Sort descending (newest UIDs first)
+      const descending = [...allAscending].reverse();
+
+      // Apply optional beforeUid filter (only UIDs strictly older/smaller than beforeUid)
+      const filtered =
+        typeof input.beforeUid === "number" && input.beforeUid > 0
+          ? descending.filter((u) => u < input.beforeUid!)
+          : descending;
+
+      const pageUids = filtered.slice(offset, offset + limit);
+      const hasMore = offset + pageUids.length < filtered.length;
+      const nextOffset = hasMore ? offset + pageUids.length : null;
+      const nextBeforeUid =
+        hasMore && pageUids.length > 0 ? pageUids[pageUids.length - 1] : null;
+
+      if (uidsOnly) {
+        return {
+          folder,
+          total,
+          offset,
+          count: pageUids.length,
+          hasMore,
+          nextOffset,
+          nextBeforeUid,
+          uidsOnly: true,
+          uids: pageUids,
+        };
       }
 
-      // UIDs are strictly ascending in IMAP; slice the last `limit` and reverse for newest first
-      const newestUids = matchingUids.slice(-limit).reverse();
+      if (pageUids.length === 0) {
+        return {
+          folder,
+          total,
+          offset,
+          count: 0,
+          hasMore: false,
+          nextOffset: null,
+          nextBeforeUid: null,
+          uidsOnly: false,
+          emails: [],
+        };
+      }
 
       const fetched = await client.fetchAll(
-        newestUids,
+        pageUids,
         {
           uid: true,
           flags: true,
           envelope: true,
           bodyStructure: true,
+          headers: ["references"],
         },
         { uid: true },
       );
 
       const byUid = new Map(fetched.map((m) => [m.uid, m]));
-      const results: EmailSummary[] = [];
-      for (const uid of newestUids) {
+      const emails: EmailSummary[] = [];
+      for (const uid of pageUids) {
         const msg = byUid.get(uid);
         if (msg) {
-          results.push(summariseMessageObject(msg));
+          emails.push(summariseMessageObject(msg));
         }
       }
-      return results;
+
+      return {
+        folder,
+        total,
+        offset,
+        count: emails.length,
+        hasMore,
+        nextOffset,
+        nextBeforeUid,
+        uidsOnly: false,
+        emails,
+      };
     } finally {
       lock.release();
     }
+  });
+}
+
+function folderExistsInList(
+  boxes: Array<{ path: string }>,
+  targetPath: string,
+): boolean {
+  if (targetPath.toUpperCase() === "INBOX") return true;
+  return boxes.some((b) => b.path === targetPath);
+}
+
+/**
+ * Creates a folder (and any missing parent folders along the "." hierarchy) and subscribes to it.
+ * Idempotent: if the folder already exists, returns { path, created: false, exists: true }.
+ */
+export async function createFolder(
+  config: SkyMailConfig,
+  path: string,
+): Promise<CreateFolderResult> {
+  if (!path || path.length === 0) {
+    throw new Error("Folder path must not be empty.");
+  }
+
+  return withImap(config, async (client) => {
+    const boxes = await client.list();
+    const existing = new Set(boxes.map((b) => b.path));
+
+    if (existing.has(path) || path.toUpperCase() === "INBOX") {
+      try {
+        await client.mailboxSubscribe(path);
+      } catch {
+        // Ignore if server doesn't need/allow subscribing existing folder
+      }
+      await logOperation("create_folder", {
+        path,
+        created: false,
+        exists: true,
+        createdParents: [],
+      });
+      return {
+        path,
+        created: false,
+        exists: true,
+        createdParents: [],
+      };
+    }
+
+    const parts = path.split(".");
+    if (parts.some((p) => p.length === 0)) {
+      throw new Error(`Invalid folder path "${path}": contains empty hierarchy segment.`);
+    }
+
+    const createdParents: string[] = [];
+    for (let i = 1; i < parts.length; i++) {
+      const parentPath = parts.slice(0, i).join(".");
+      if (!existing.has(parentPath)) {
+        const parentRes = await client.mailboxCreate(parentPath);
+        existing.add(parentPath);
+        if (parentRes?.created) {
+          createdParents.push(parentPath);
+        }
+        try {
+          await client.mailboxSubscribe(parentPath);
+        } catch {
+          // mailboxCreate in ImapFlow already runs SUBSCRIBE, ignore if redundant
+        }
+      }
+    }
+
+    const res = await client.mailboxCreate(path);
+    try {
+      await client.mailboxSubscribe(path);
+    } catch {
+      // Already subscribed by mailboxCreate
+    }
+
+    const result: CreateFolderResult = {
+      path,
+      created: Boolean(res?.created),
+      exists: true,
+      createdParents,
+    };
+
+    await logOperation("create_folder", { ...result });
+    return result;
+  });
+}
+
+/**
+ * Moves up to 200 emails by UID from `folder` to `destination` while preserving read/unread flags.
+ * Uses UID MOVE (RFC 6851) or falls back to UID COPY + UID STORE \Deleted + UID EXPUNGE (UIDPLUS).
+ * Never executes a mailbox-wide EXPUNGE.
+ */
+export async function moveEmails(
+  config: SkyMailConfig,
+  input: MoveEmailsInput,
+): Promise<MoveEmailsResult> {
+  const folder = input.folder;
+  const destination = input.destination;
+  const dryRun = Boolean(input.dryRun);
+
+  if (!folder || folder.length === 0) {
+    throw new Error("Source folder is required.");
+  }
+  if (!destination || destination.length === 0) {
+    throw new Error("Destination folder is required.");
+  }
+  if (folder === destination) {
+    throw new Error(`Source and destination folders must be different ("${folder}").`);
+  }
+  if (!Array.isArray(input.uids) || input.uids.length === 0) {
+    throw new Error("At least one UID must be provided in `uids`.");
+  }
+  if (input.uids.length > 200) {
+    throw new Error(
+      `Maximum 200 UIDs allowed per move_emails call (received ${input.uids.length}).`,
+    );
+  }
+
+  const uniqueUids = Array.from(new Set(input.uids));
+
+  return withImap(config, async (client) => {
+    const boxes = await client.list();
+    if (!folderExistsInList(boxes, folder)) {
+      throw new Error(`Source folder "${folder}" does not exist.`);
+    }
+    if (!folderExistsInList(boxes, destination)) {
+      throw new Error(
+        `Destination folder "${destination}" does not exist. Create it first with create_folder.`,
+      );
+    }
+
+    const lock = await client.getMailboxLock(folder);
+    try {
+      // Check which UIDs actually exist in the source folder
+      const existingMsgs = await client.fetchAll(
+        uniqueUids,
+        { uid: true },
+        { uid: true },
+      );
+      const existingUidSet = new Set(existingMsgs.map((m) => m.uid));
+      const foundUids = uniqueUids.filter((u) => existingUidSet.has(u));
+      const notFound = uniqueUids.filter((u) => !existingUidSet.has(u));
+
+      if (dryRun || foundUids.length === 0) {
+        const result: MoveEmailsResult = {
+          folder,
+          destination,
+          dryRun,
+          moved: foundUids.length,
+          notFound,
+          mapping: foundUids.map((oldUid) => ({ oldUid, newUid: null })),
+        };
+        await logOperation("move_emails", {
+          folder,
+          destination,
+          dryRun,
+          requestedCount: uniqueUids.length,
+          moved: result.moved,
+          uids: foundUids,
+          notFound,
+        });
+        return result;
+      }
+
+      // Safety guarantee: never run a mailbox-wide EXPUNGE
+      const hasMove = client.capabilities.has("MOVE");
+      const hasUidPlus = client.capabilities.has("UIDPLUS");
+      if (!hasMove && !hasUidPlus) {
+        throw new Error(
+          "Server supports neither UID MOVE (RFC 6851) nor UIDPLUS (UID EXPUNGE); refusing to move to avoid mailbox-wide EXPUNGE.",
+        );
+      }
+
+      const moveRes = await client.messageMove(foundUids, destination, {
+        uid: true,
+      });
+      if (!moveRes) {
+        throw new Error(
+          `IMAP move command failed from "${folder}" to "${destination}".`,
+        );
+      }
+
+      const uidMap = moveRes.uidMap;
+      const mapping: MoveUidMapping[] = foundUids.map((oldUid) => ({
+        oldUid,
+        newUid: uidMap?.get(oldUid) ?? null,
+      }));
+
+      const result: MoveEmailsResult = {
+        folder,
+        destination,
+        dryRun: false,
+        moved: foundUids.length,
+        notFound,
+        mapping,
+      };
+
+      await logOperation("move_emails", {
+        folder,
+        destination,
+        dryRun: false,
+        moved: result.moved,
+        uids: foundUids,
+        notFound,
+        mapping,
+      });
+
+      return result;
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+/**
+ * Renames a folder (moving all its messages and subfolders) and updates IMAP subscriptions.
+ * Errors if `newPath` already exists.
+ */
+export async function renameFolder(
+  config: SkyMailConfig,
+  path: string,
+  newPath: string,
+): Promise<RenameFolderResult> {
+  if (!path || path.length === 0) {
+    throw new Error("Current folder `path` is required.");
+  }
+  if (!newPath || newPath.length === 0) {
+    throw new Error("Target folder `newPath` is required.");
+  }
+  if (path === newPath) {
+    throw new Error("`path` and `newPath` must be different.");
+  }
+  if (path.toUpperCase() === "INBOX") {
+    throw new Error("Cannot rename INBOX.");
+  }
+
+  return withImap(config, async (client) => {
+    const boxes = await client.list();
+    const existing = new Set(boxes.map((b) => b.path));
+
+    if (!existing.has(path)) {
+      throw new Error(`Folder "${path}" does not exist.`);
+    }
+    if (existing.has(newPath) || newPath.toUpperCase() === "INBOX") {
+      throw new Error(`Target folder "${newPath}" already exists.`);
+    }
+
+    // Ensure parent folders of newPath exist if moving into a hierarchy
+    const newParts = newPath.split(".");
+    for (let i = 1; i < newParts.length; i++) {
+      const parentPath = newParts.slice(0, i).join(".");
+      if (!existing.has(parentPath)) {
+        await client.mailboxCreate(parentPath);
+        existing.add(parentPath);
+      }
+    }
+
+    const subfolders = boxes
+      .filter((b) => b.path.startsWith(`${path}.`))
+      .map((b) => b.path);
+
+    await client.mailboxRename(path, newPath);
+
+    // Update subscriptions for the renamed folder and any subfolders
+    try {
+      await client.mailboxSubscribe(newPath);
+    } catch {
+      // Ignore subscription warning
+    }
+    try {
+      await client.mailboxUnsubscribe(path);
+    } catch {
+      // Ignore unsubscribe warning
+    }
+
+    for (const oldSub of subfolders) {
+      const newSub = `${newPath}${oldSub.slice(path.length)}`;
+      try {
+        await client.mailboxSubscribe(newSub);
+      } catch {
+        // Ignore
+      }
+      try {
+        await client.mailboxUnsubscribe(oldSub);
+      } catch {
+        // Ignore
+      }
+    }
+
+    const result: RenameFolderResult = {
+      path,
+      newPath,
+      renamedSubfolders: subfolders.length,
+    };
+
+    await logOperation("rename_folder", { ...result });
+    return result;
+  });
+}
+
+/**
+ * Deletes a folder ONLY if it has zero messages and zero subfolders.
+ */
+export async function deleteFolder(
+  config: SkyMailConfig,
+  path: string,
+): Promise<DeleteFolderResult> {
+  if (!path || path.length === 0) {
+    throw new Error("Folder `path` is required.");
+  }
+  if (path.toUpperCase() === "INBOX") {
+    throw new Error("Cannot delete INBOX.");
+  }
+
+  return withImap(config, async (client) => {
+    const boxes = await client.list();
+    const targetBox = boxes.find((b) => b.path === path);
+    if (!targetBox) {
+      throw new Error(`Folder "${path}" does not exist.`);
+    }
+    if (targetBox.specialUse) {
+      throw new Error(
+        `Cannot delete special-use system folder "${path}" (${targetBox.specialUse}).`,
+      );
+    }
+
+    const subfolders = boxes
+      .filter((b) => b.path.startsWith(`${path}.`))
+      .map((b) => b.path);
+    if (subfolders.length > 0) {
+      throw new Error(
+        `Cannot delete folder "${path}" because it has ${subfolders.length} subfolder(s): ${subfolders.slice(0, 5).join(", ")}.`,
+      );
+    }
+
+    const status = await client.status(path, { messages: true });
+    const messageCount = status.messages ?? 0;
+    if (messageCount > 0) {
+      throw new Error(
+        `Cannot delete folder "${path}" because it is not empty (${messageCount} message(s)).`,
+      );
+    }
+
+    try {
+      await client.mailboxUnsubscribe(path);
+    } catch {
+      // Ignore
+    }
+    await client.mailboxDelete(path);
+
+    const result: DeleteFolderResult = {
+      path,
+      deleted: true,
+    };
+
+    await logOperation("delete_folder", { ...result });
+    return result;
   });
 }
 
@@ -487,7 +1047,11 @@ export async function resolveReplyHeaders(
     return { subject };
   }
 
-  const replyFolder = input.replyToFolder?.trim() || "INBOX";
+  // Preserve exact folder name (do not .trim())
+  const replyFolder =
+    input.replyToFolder && input.replyToFolder.length > 0
+      ? input.replyToFolder
+      : "INBOX";
   const lock = await client.getMailboxLock(replyFolder);
   try {
     const orig = await client.fetchOne(
